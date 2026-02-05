@@ -1,0 +1,20 @@
+# Python virtual environments
+venv/
+.env/
+fedproto_env/
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# ML artifacts
+*.pt
+*.pth
+*.ckpt
+tensorboard/
+runs/
+
+# datasets / results
+data/
+results/
+partitions/
