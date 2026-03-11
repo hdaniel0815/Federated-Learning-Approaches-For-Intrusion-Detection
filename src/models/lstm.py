@@ -82,6 +82,11 @@ class StudentLSTM(nn.Module):
         """
         x: [batch, seq_len, input_dim]
         """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)          # (D,) -> (1, D)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+
         _, (h_n, _) = self.feature_extractor(x)
         features = h_n[-1]                    # [B, hidden_dim]
         prototypes = self.projection_head(features)

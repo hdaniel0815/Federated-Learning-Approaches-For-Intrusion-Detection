@@ -6,6 +6,37 @@ import pandas as pd
 from tqdm import tqdm
 
 LABEL_COL = "label_encoded"   # must exist in your final parquets
+PARTS_DIR = "data/cic2018/processed_final"  # your 79 final parts folder
+OUT_DIR = "partitions/train"
+TEST_DIR = "partitions/test"
+
+def split_parts_train_test(parts_dir: str, test_frac: float, seed: int):
+    parts = list_parts(parts_dir)
+    rng = np.random.default_rng(seed)
+    idx = np.arange(len(parts))
+    rng.shuffle(idx)
+
+    n_test = max(1, int(round(len(parts) * test_frac)))
+    test_idx = idx[:n_test]
+    train_idx = idx[n_test:]
+
+    train_parts = [parts[i] for i in train_idx]
+    test_parts  = [parts[i] for i in test_idx]
+    return train_parts, test_parts
+
+def save_test_parts(test_parts: List[Path], output_dir: Path, seed: int):
+    output = {
+        "num_parts": len(test_parts),
+        "test_parts": [p.name for p in test_parts],
+    }
+
+    filename = "test_partition_seed_" + str(seed)
+    file_path = output_dir + '/' + filename
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with open(file_path, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"Saved {filename} to: {output_dir}")
 
 def list_parts(parquet_dir: str) -> List[Path]:
     parts = sorted(Path(parquet_dir).glob("*.parquet"))
@@ -152,8 +183,6 @@ def partition_dirichlet_parquet(parts_dir: str, num_clients: int = 10, alpha: fl
 
 
 def main():
-    PARTS_DIR = "data/cic2018/processed_final"  # your 79 final parts folder
-    OUT_DIR = "partitions"
     os.makedirs(OUT_DIR, exist_ok=True)
 
     """Main partitioning function."""
@@ -163,21 +192,27 @@ def main():
 
     # Set random seed for reproducibility
     np.random.seed(42)
+    seed = [42, 123, 456]
     
     # Dirichlet partitions
-    for a in [0.1, 0.5, 1.0]:
-        part = partition_dirichlet_parquet(PARTS_DIR, num_clients=10, alpha=a, seed=42)
-        save_partition(
-            part,
-            os.path.join(OUT_DIR, f"cic_dirichlet_{a}.json"),
-            metadata={"dataset":"CIC-IDS2018", "strategy":"dirichlet", "alpha":a, "num_clients":10, "seed":42,
-                      "parts_dir": PARTS_DIR, "label_col": LABEL_COL},
-        )
+    for s in seed:
 
-    # realistic heterogenuos partitions
+        train_parts, test_parts = split_parts_train_test(PARTS_DIR, 20.0, s)
+        save_test_parts(test_parts, TEST_DIR, s)
+
+        for a in [0.1, 0.5, 1.0]:
+            part = partition_dirichlet_parquet(PARTS_DIR, num_clients=10, alpha=a, seed=s)
+            save_partition(
+                part,
+                os.path.join(OUT_DIR, f"cic_dirichlet_{a}_seed_{s}.json"),
+                metadata={"dataset":"CIC-IDS2018", "strategy":"dirichlet", "alpha":a, "num_clients":10, "seed":s,
+                        "parts_dir": PARTS_DIR, "label_col": LABEL_COL},
+            )
+
+        # realistic heterogenuos partitions
     realistic = partition_by_day_parquet(PARTS_DIR, day_col="day")
-    save_partition(part, os.path.join(OUT_DIR, "cic_realistic_day.json"),
-                  metadata={"dataset":"CIC-IDS2018","strategy":"day","num_clients":10,"seed":42})
+    save_partition(realistic, os.path.join(OUT_DIR, "cic_realistic_day_seed.json"),
+                metadata={"dataset":"CIC-IDS2018","strategy":"day","num_clients":10,"seed":42})
 
 
     print("\n" + "="*60)
