@@ -55,7 +55,6 @@ class FedProxPlugin:
 
     def on_round_start(self, client, payload: ServerPayload):
         # snapshot model weights at start of round (after loading global weights)
-        print("ON ROUND START")
         if self.mu > 0:
             self.w0 = {k: v.detach().clone() for k, v in client.model.state_dict().items()}
 

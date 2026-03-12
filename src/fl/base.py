@@ -19,6 +19,7 @@ class ClientUpdate:
     weights: dict | None = None
     pub_logits: np.ndarray | None = None
     prototypes: dict | None = None
+    bytes_sent: int = 0   # bytes communicated to server this round
 
 
 @dataclass
