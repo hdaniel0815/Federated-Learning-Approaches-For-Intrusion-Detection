@@ -23,11 +23,15 @@ import matplotlib
 matplotlib.use("Agg")     # non-interactive backend (safe on Windows / headless)
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+from src.datasets.loaders import (
+    ClientParquetRowsDataset,
+    make_test_loader,
+    make_public_loader,
+)
 from tqdm import tqdm
 
 from src.fl.base import ServerPayload, ClientUpdate
@@ -120,161 +124,6 @@ def log(stage: str, **kv: Any) -> None:
 def _safe_stem(s: str) -> str:
     """Replace characters unsafe for filenames."""
     return re.sub(r"[^\w\-]", "_", s)
-
-
-# ---------------------------------------------------------------------------
-# Datasets
-# ---------------------------------------------------------------------------
-
-class ClientParquetRowsDataset(Dataset):
-    """
-    parts_to_rows: list of {"part": "final_part_00000.parquet", "rows": [1,2,3,...]}
-    """
-    def __init__(
-        self,
-        parts_dir: Path,
-        parts_to_rows: List[dict],
-        feature_cols: List[str],
-        label_col: str,
-    ):
-        self.parts_dir   = Path(parts_dir)
-        self.feature_cols = list(feature_cols)
-        self.label_col   = label_col
-
-        part_map: Dict[str, np.ndarray] = {}
-        for item in parts_to_rows:
-            part = item["part"]
-            rows = np.array(item["rows"], dtype=np.int64)
-            part_map[part] = rows
-        self.part_to_rows = part_map
-
-        self.samples: List[Tuple[str, int]] = []
-        for part, rows in self.part_to_rows.items():
-            for j in range(len(rows)):
-                self.samples.append((part, j))
-        self.samples.sort(key=lambda t: (t[0], int(self.part_to_rows[t[0]][t[1]])))
-
-        self._cache_part: Optional[str] = None
-        self._cache_df: Optional[Tuple] = None
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def _load_part(self, part: str) -> Tuple[np.ndarray, np.ndarray]:
-        if self._cache_part == part and self._cache_df is not None:
-            return self._cache_df
-        df = pd.read_parquet(
-            self.parts_dir / part,
-            columns=self.feature_cols + [self.label_col],
-        )
-        X = df[self.feature_cols].to_numpy(dtype=np.float32, copy=False)
-        y = df[self.label_col].to_numpy()
-        self._cache_part = part
-        self._cache_df   = (X, y)
-        return self._cache_df
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        part, j  = self.samples[idx]
-        row_idx  = int(self.part_to_rows[part][j])
-        X, y     = self._load_part(part)
-        return torch.from_numpy(X[row_idx]), torch.tensor(int(y[row_idx]), dtype=torch.long)
-
-
-class PublicParquetRowsDataset(Dataset):
-    def __init__(
-        self,
-        parts_dir: "str | Path",
-        samples: List[Tuple[str, int]],
-        feature_cols: List[str],
-        label_col: str,
-    ):
-        self.parts_dir    = Path(parts_dir)
-        self.samples      = samples
-        self.feature_cols = list(feature_cols)
-        self.label_col    = label_col
-        self._cache_part  = None
-        self._cache_df    = None
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def _load_part(self, part_name: str) -> pd.DataFrame:
-        if self._cache_part == part_name and self._cache_df is not None:
-            return self._cache_df
-        df = pd.read_parquet(
-            self.parts_dir / part_name,
-            columns=self.feature_cols + [self.label_col],
-        )
-        self._cache_part, self._cache_df = part_name, df
-        return df
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        part_name, row_idx = self.samples[idx]
-        df  = self._load_part(part_name)
-        row = df.iloc[int(row_idx)]
-        x   = torch.tensor(row[self.feature_cols].to_numpy(dtype=np.float32))
-        y   = torch.tensor(int(row[self.label_col]), dtype=torch.long)
-        return x, y
-
-
-# ---------------------------------------------------------------------------
-# Loader factories
-# ---------------------------------------------------------------------------
-
-def make_test_loader(
-    *,
-    parts_dir: "str | Path",
-    test_manifest_path: "str | Path",
-    feature_cols: List[str],
-    label_col: str,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Build a DataLoader for the held-out test set from the test manifest JSON."""
-    with open(test_manifest_path) as f:
-        meta = json.load(f)
-    parts_dir = Path(parts_dir)
-    rows = [
-        {
-            "part": p,
-            "rows": list(range(pq.ParquetFile(parts_dir / p).metadata.num_rows)),
-        }
-        for p in meta["test_parts"]
-    ]
-    ds = ClientParquetRowsDataset(parts_dir, rows, feature_cols, label_col)
-    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-
-def make_public_loader(
-    *,
-    parts_dir: "str | Path",
-    public_manifest_path: "str | Path",
-    feature_cols: List[str],
-    label_col: str,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """
-    Build a DataLoader for the public (distillation) set from the public manifest JSON.
-    Using a manifest guarantees no overlap with train or test sets.
-    """
-    with open(public_manifest_path) as f:
-        meta = json.load(f)
-    parts_dir = Path(parts_dir)
-    samples: List[Tuple[str, int]] = []
-    for part_name in meta["public_parts"]:
-        n = pq.ParquetFile(parts_dir / part_name).metadata.num_rows
-        for r in range(n):
-            samples.append((part_name, r))
-
-    ds = PublicParquetRowsDataset(parts_dir, samples, feature_cols, label_col)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +579,7 @@ def main():
         "lr":               1e-3,
     }
 
-    strategies_to_run_base = ["fedprotokd"]
+    strategies_to_run_base = ["fedprox","fedavg","fedmd","fedprotokd"]
 
     for ds_name, ds_cfg in DATASETS.items():
         parquets_dir = Path(ds_cfg["parquets"])

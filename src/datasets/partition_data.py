@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Dict, List, Union
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 LABEL_COL = "label_encoded"   # must exist in final parquets
@@ -64,7 +65,10 @@ def save_partition(partition: Dict, output_path: str, metadata: Dict = None):
 def save_test_parts(test_parts: List[Path], output_dir: str, seed: int):
     output = {
         "num_parts":  len(test_parts),
-        "test_parts": [p.name for p in test_parts],
+        "test_parts": [
+            {"part": p.name, "num_rows": pq.read_metadata(p).num_rows}
+            for p in test_parts
+        ],
     }
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"test_partition_seed_{seed}.json")
@@ -76,7 +80,10 @@ def save_test_parts(test_parts: List[Path], output_dir: str, seed: int):
 def save_public_parts(public_parts: List[Path], output_dir: str, seed: int):
     output = {
         "num_parts":    len(public_parts),
-        "public_parts": [p.name for p in public_parts],
+        "public_parts": [
+            {"part": p.name, "num_rows": pq.read_metadata(p).num_rows}
+            for p in public_parts
+        ],
     }
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"public_partition_seed_{seed}.json")
