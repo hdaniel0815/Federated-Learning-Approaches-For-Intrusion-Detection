@@ -1,6 +1,13 @@
 """
-Shared preprocessing utilities reused by all dataset-specific preprocess_*.py scripts.
-Stages 2 and 3 are identical across CIC-IDS-2018, CIC-IDS-2017, and UNSW-NB15.
+Shared preprocessing utilities (Stages 2 and 3) — no pyarrow / parquet dependency.
+
+Stage 2: compute global statistics from cleaned .csv.gz files
+Stage 3: write final normalised data as compressed NumPy archives (.npz)
+
+Each final .npz file contains:
+    X   — float32 array (N, num_features)  — normalised features
+    y   — int32  array  (N,)               — encoded class label
+    day — unicode array (N,)               — day/file identifier for day-based partitioning
 """
 import os, json
 import numpy as np
@@ -17,10 +24,19 @@ EXCLUDE_FROM_FEATURES = {ATTACK_CAT, LABEL_ENCODED_COL, "day"}
 # Helpers
 # ---------------------------------------------------------------------------
 
-def list_parquet_parts(parquet_dir: str) -> List[Path]:
-    parts = sorted(Path(parquet_dir).glob("*.parquet"))
+def list_clean_parts(clean_dir: str) -> List[Path]:
+    """Return sorted list of cleaned .csv.gz parts."""
+    parts = sorted(Path(clean_dir).glob("*.csv.gz"))
     if not parts:
-        raise FileNotFoundError(f"No parquet files found in {parquet_dir}")
+        raise FileNotFoundError(f"No .csv.gz files found in {clean_dir}")
+    return parts
+
+
+def list_final_parts(final_dir: str) -> List[Path]:
+    """Return sorted list of final .npz parts."""
+    parts = sorted(Path(final_dir).glob("*.npz"))
+    if not parts:
+        raise FileNotFoundError(f"No .npz files found in {final_dir}")
     return parts
 
 
@@ -32,9 +48,9 @@ def safe_std(var: float) -> float:
 # Stage 2: compute global statistics and encoders
 # ---------------------------------------------------------------------------
 
-def compute_global_stats_and_encoders(clean_parquet_dir: str, stats_out_dir: str):
+def compute_global_stats_and_encoders(clean_csv_dir: str, stats_out_dir: str):
     """
-    Single-pass over all cleaned parquets to compute:
+    Single-pass over all cleaned .csv.gz files to compute:
       - per-column mean / std  (numeric_stats.json)
       - categorical value→index maps  (cat_encoders.json)
       - attack-category label→index map  (label_encoder.json)
@@ -43,13 +59,15 @@ def compute_global_stats_and_encoders(clean_parquet_dir: str, stats_out_dir: str
     import pandas as pd
 
     os.makedirs(stats_out_dir, exist_ok=True)
-    parts = list_parquet_parts(clean_parquet_dir)
+    parts = list_clean_parts(clean_csv_dir)
 
-    first = pd.read_parquet(parts[0])
+    # Read a small sample to discover column types
+    first = pd.read_csv(parts[0], nrows=200)
     first.columns = first.columns.str.strip()
 
     if ATTACK_CAT not in first.columns:
-        raise ValueError(f"Expected '{ATTACK_CAT}' column in cleaned dataset")
+        raise ValueError(f"Expected '{ATTACK_CAT}' column in cleaned dataset. "
+                         f"Got: {list(first.columns[:10])}")
 
     all_cols = [c for c in first.columns if c not in EXCLUDE_FROM_FEATURES]
     num_cols = first[all_cols].select_dtypes(include=[np.number]).columns.tolist()
@@ -62,7 +80,7 @@ def compute_global_stats_and_encoders(clean_parquet_dir: str, stats_out_dir: str
     label_values: set = set()
 
     for part in tqdm(parts, desc="Pass 1: global stats"):
-        df = pd.read_parquet(part)
+        df = pd.read_csv(part)
         df.columns = df.columns.str.strip()
 
         label_values.update(df[ATTACK_CAT].dropna().astype(str).unique().tolist())
@@ -97,11 +115,16 @@ def compute_global_stats_and_encoders(clean_parquet_dir: str, stats_out_dir: str
     cat_encoders  = {c: {v: i for i, v in enumerate(sorted(vals))}
                      for c, vals in cat_values.items()}
     label_encoder = {v: i for i, v in enumerate(sorted(label_values))}
+    feature_cols  = num_cols + cat_cols
+
     meta = {
-        "num_cols": num_cols,
-        "cat_cols": cat_cols,
-        "target_col": ATTACK_CAT,
+        "num_cols":          num_cols,
+        "cat_cols":          cat_cols,
+        "feature_cols":      feature_cols,
+        "num_features":      len(feature_cols),
+        "target_col":        ATTACK_CAT,
         "label_encoded_col": LABEL_ENCODED_COL,
+        "num_classes":       len(label_encoder),
     }
 
     with open(os.path.join(stats_out_dir, "numeric_stats.json"), "w") as f:
@@ -114,22 +137,28 @@ def compute_global_stats_and_encoders(clean_parquet_dir: str, stats_out_dir: str
         json.dump(meta, f)
 
     print(f"\nSaved stats to: {stats_out_dir}")
-    print(f"Numeric cols: {len(num_cols)} | Categorical cols: {len(cat_cols)} "
-          f"| Labels: {len(label_encoder)}")
+    print(f"Features: {len(feature_cols)} (numeric={len(num_cols)}, cat={len(cat_cols)}) "
+          f"| Classes: {len(label_encoder)}")
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: apply stats → final normalised parquets
+# Stage 3: apply stats → final .npz files
 # ---------------------------------------------------------------------------
 
-def transform_to_final_parquet(clean_parquet_dir: str, final_parquet_dir: str, stats_dir: str):
+def transform_to_final_npz(clean_csv_dir: str, final_npz_dir: str, stats_dir: str):
     """
-    Z-score normalise numeric cols, encode categorical cols, write final parquets.
+    Z-score normalise numeric cols, integer-encode categorical cols,
+    write each part as a compressed NumPy archive (.npz).
+
+    Output arrays per file:
+        X   — float32 (N, num_features)
+        y   — int32   (N,)
+        day — unicode (N,)  — used by day-based partitioning
     """
     import pandas as pd
 
-    os.makedirs(final_parquet_dir, exist_ok=True)
-    parts = list_parquet_parts(clean_parquet_dir)
+    os.makedirs(final_npz_dir, exist_ok=True)
+    parts = list_clean_parts(clean_csv_dir)
 
     with open(os.path.join(stats_dir, "numeric_stats.json")) as f:
         numeric_stats = json.load(f)
@@ -140,29 +169,34 @@ def transform_to_final_parquet(clean_parquet_dir: str, final_parquet_dir: str, s
     with open(os.path.join(stats_dir, "meta.json")) as f:
         meta = json.load(f)
 
-    num_cols = meta["num_cols"]
-    cat_cols = meta["cat_cols"]
+    num_cols     = meta["num_cols"]
+    cat_cols     = meta["cat_cols"]
+    feature_cols = meta["feature_cols"]
 
-    for idx, part in enumerate(tqdm(parts, desc="Stage 3: transform")):
-        df = pd.read_parquet(part)
+    for idx, part in enumerate(tqdm(parts, desc="Stage 3: transform → .npz")):
+        df = pd.read_csv(part)
         df.columns = df.columns.str.strip()
 
+        # Integer-encode categorical features
         for c in cat_cols:
             if c in df.columns:
                 mapping = cat_encoders.get(c, {})
-                df[c] = df[c].astype(str).map(mapping).fillna(-1).astype(np.int32)
+                df[c] = df[c].astype(str).map(mapping).fillna(-1).astype(np.float32)
 
+        # Z-score normalise numeric features
         for c in num_cols:
             if c in df.columns:
                 mu = float(numeric_stats[c]["mean"])
                 sd = float(numeric_stats[c]["std"]) or 1.0
                 df[c] = (df[c].astype(np.float32) - mu) / sd
 
-        df[LABEL_ENCODED_COL] = (
-            df[ATTACK_CAT].astype(str).map(label_encoder).fillna(-1).astype(np.int32)
-        )
+        X   = df[feature_cols].to_numpy(dtype=np.float32)
+        y   = (df[ATTACK_CAT].astype(str)
+               .map(label_encoder).fillna(-1).astype(np.int32).to_numpy())
+        day = (df["day"].astype(str).to_numpy()
+               if "day" in df.columns else np.array([""] * len(df), dtype=str))
 
-        out_path = os.path.join(final_parquet_dir, f"final_part_{idx:05d}.parquet")
-        df.to_parquet(out_path, index=False, compression="snappy")
+        out_path = os.path.join(final_npz_dir, f"final_part_{idx:05d}.npz")
+        np.savez_compressed(out_path, X=X, y=y, day=day)
 
-    print(f"\nWrote {len(parts)} final parquet parts to: {final_parquet_dir}")
+    print(f"\nWrote {len(parts)} .npz parts to: {final_npz_dir}")

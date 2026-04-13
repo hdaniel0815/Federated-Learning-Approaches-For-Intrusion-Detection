@@ -1,20 +1,10 @@
-"""
-Federated Learning baseline training script.
-
-Runs FedAvg, FedProx, FedMD, and FedProtoKD on each dataset × partition × model
-combination, collecting Dan-H-style parallel-list histories with bandwidth tracking.
-
-Execution order:
-  1. python src/datasets/preprocess_cic2017.py   (or cic / unswnb15)
-  2. python src/datasets/partition_data.py
-  3. python scripts/train_baselines.py
-"""
 from __future__ import annotations
 
 import copy
 import json
 import random
 import re
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,12 +13,14 @@ import matplotlib
 matplotlib.use("Agg")     # non-interactive backend (safe on Windows / headless)
 import matplotlib.pyplot as plt
 import numpy as np
+print("importing torch...", flush=True)
 import torch
+print(f"torch imported, cuda: {torch.cuda.is_available()}", flush=True)
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from src.datasets.loaders import (
-    ClientParquetRowsDataset,
+    ClientNpzDataset,
     make_test_loader,
     make_public_loader,
 )
@@ -58,32 +50,18 @@ ACCURACY_THRESHOLD = 0.90   # for rounds_to_threshold metric
 MODEL_BUILDERS = {
     "lstm":        lambda input_dim, num_classes: StudentLSTM(input_dim, num_classes),
     "transformer": lambda input_dim, num_classes: StudentTabTransformer(input_dim, num_classes),
+    "cnn1d": lambda input_dim, num_classes: StudentCNN1D(input_dim, num_classes),
+    "mlp": lambda input_dim, num_classes: StudentMLP(input_dim, num_classes)
 }
 
+DATA_ROOT = os.environ.get("DATA_ROOT", ".")
+ 
+RUN_DATASET = os.environ.get("RUN_DATASET", None)
+RUN_MODEL = os.environ.get("RUN_MODEL", None)
+RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "results")
+
 # Per-dataset paths (all three datasets supported)
-DATASETS: Dict[str, Dict[str, str]] = {
-    "cic2018": {
-        "stats_dir":    "data/cic2018/stats",
-        "parquets":     "data/cic2018/processed_final",
-        "train_parts":  "partitions/cic2018/train",
-        "test_parts":   "partitions/cic2018/test",
-        "public_parts": "partitions/cic2018/public",
-    },
-    "cic2017": {
-        "stats_dir":    "data/cic2017/stats",
-        "parquets":     "data/cic2017/processed_final",
-        "train_parts":  "partitions/cic2017/train",
-        "test_parts":   "partitions/cic2017/test",
-        "public_parts": "partitions/cic2017/public",
-    },
-    "unswnb15": {
-        "stats_dir":    "data/unswnb15/stats",
-        "parquets":     "data/unswnb15/processed_final",
-        "train_parts":  "partitions/unswnb15/train",
-        "test_parts":   "partitions/unswnb15/test",
-        "public_parts": "partitions/unswnb15/public",
-    },
-}
+DATASETS = { "cic2018": { "stats_dir": f"{DATA_ROOT}/data/cic2018/stats", "data_dir": f"{DATA_ROOT}/data/cic2018/processed_final", "train_parts": f"{DATA_ROOT}/partitions/cic2018/train", "test_parts": f"{DATA_ROOT}/partitions/cic2018/test", "public_parts": f"{DATA_ROOT}/partitions/cic2018/public", }, "cic2017": { "stats_dir": f"{DATA_ROOT}/data/cic2017/stats", "data_dir": f"{DATA_ROOT}/data/cic2017/processed_final", "train_parts": f"{DATA_ROOT}/partitions/cic2017/train", "test_parts": f"{DATA_ROOT}/partitions/cic2017/test", "public_parts": f"{DATA_ROOT}/partitions/cic2017/public", }, "unswnb15": { "stats_dir": f"{DATA_ROOT}/data/unswnb15/stats", "data_dir": f"{DATA_ROOT}/data/unswnb15/processed_final", "train_parts": f"{DATA_ROOT}/partitions/unswnb15/train", "test_parts": f"{DATA_ROOT}/partitions/unswnb15/test", "public_parts": f"{DATA_ROOT}/partitions/unswnb15/public", }, }
 
 # Strategy color palette (matches Dan-H-codes-v1 convention)
 STRATEGY_COLORS = {
@@ -166,12 +144,61 @@ class FLClient:
         local_epochs: int = 1,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
+        lr_scheduler: Optional[str] = None,   # "cosine" | "step" | None
+        current_round: int = 1,
+        total_rounds: int = 20,
     ) -> ClientUpdate:
         self._apply_payload(payload)
 
+        if torch.cuda.is_available():
+            assert next(self.model.parameters()).device.type == "cuda", \
+                f"Model is on CPU after _apply_payload! client {self.cid}"
+
+        all_labels = []
+        with torch.no_grad():
+            for _, y in self.train_loader:
+                all_labels.append(y.numpy())
+        all_labels = np.concatenate(all_labels)
+        classes    = np.unique(all_labels)
+
+        from sklearn.utils.class_weight import compute_class_weight
+        raw_weights = compute_class_weight(
+            class_weight="balanced",
+            classes=classes,
+            y=all_labels,
+        )
+        # Build a weight tensor of length num_classes; classes absent locally get weight 0
+        # (they will not appear in any batch so 0 is safe and avoids index errors)
+        num_classes_model = next(
+            p.shape[0] for name, p in self.model.named_parameters()
+            if "classifier" in name or name.endswith("weight") and p.dim() == 2
+        ) if hasattr(self.model, "num_classes") else self.model.num_classes \
+            if hasattr(self.model, "num_classes") else int(all_labels.max()) + 1
+
+        if hasattr(self.model, "num_classes"):
+            num_classes_model = self.model.num_classes
+        else:
+            num_classes_model = int(all_labels.max()) + 1
+
+        weight_tensor = torch.zeros(num_classes_model, dtype=torch.float32, device=self.device)
+        for cls, w in zip(classes, raw_weights):
+            weight_tensor[int(cls)] = float(w)
+
         opt     = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        ce      = torch.nn.CrossEntropyLoss()
+        ce      = torch.nn.CrossEntropyLoss(weight=weight_tensor)
         plugins = self.plugins
+
+        total_local_steps = local_epochs * len(self.train_loader)
+        scheduler = None
+        if lr_scheduler == "cosine" and total_local_steps > 1:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=total_local_steps, eta_min=lr * 0.01,
+            )
+        elif lr_scheduler == "step" and total_local_steps > 1:
+            milestones = [int(total_local_steps * 0.6), int(total_local_steps * 0.8)]
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                opt, milestones=milestones, gamma=0.5,
+            )
 
         for p in plugins:
             p.on_round_start(self, payload)
@@ -179,8 +206,8 @@ class FLClient:
         total_seen = 0
         self.model.train()
 
-        for _ in tqdm(range(local_epochs), desc="local training progress"):
-            for x, y in self.train_loader:
+        for _ in range(local_epochs):
+            for x, y in tqdm(self.train_loader, desc="Local training progress:w"):
                 x, y  = x.to(self.device), y.to(self.device)
                 batch = (x, y)
 
@@ -193,6 +220,8 @@ class FLClient:
 
                 loss.backward()
                 opt.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 for p in plugins:
                     p.after_step(self, batch, (logits, protos, feats), payload)
@@ -207,16 +236,17 @@ class FLClient:
         pub_logits = extra.get("pub_logits")
         prototypes = extra.get("prototypes")
 
-        # Bandwidth: count only what the server actually receives
         if pub_logits is not None:
             # FedMD: server receives logits, not weights
             bytes_sent = int(pub_logits.nbytes)
+        elif prototypes is not None:
+            # FedProtoKD: server receives prototypes only
+            bytes_sent = sum(
+                np.array(v, dtype=np.float32).nbytes for v in prototypes.values()
+            )
         else:
+            # FedAvg / FedProx: server receives full model weights
             bytes_sent = sum(v.nelement() * v.element_size() for v in weights.values())
-            if prototypes is not None:
-                bytes_sent += sum(
-                    np.array(v, dtype=np.float32).nbytes for v in prototypes.values()
-                )
 
         return ClientUpdate(
             client_id=self.cid,
@@ -230,6 +260,14 @@ class FLClient:
     def _apply_payload(self, payload: ServerPayload) -> None:
         if payload.weights is not None:
             self.model.load_state_dict(payload.weights, strict=True)
+            self.model.to(self.device)
+
+            param_devices = {name: p.device for name, p in self.model.named_parameters()}
+            on_cpu = {n: d for n, d in param_devices.items() if d.type != "cuda"}
+            print(f"[client {self.cid}] self.device={self.device}", flush=True)
+            print(f"[client {self.cid}] params on CPU: {on_cpu}", flush=True)
+            print(f"[client {self.cid}] payload.weights sample device: "
+                  f"{next(iter(payload.weights.values())).device}", flush=True)
 
     def _forward_pack(
         self, x: torch.Tensor
@@ -267,11 +305,9 @@ def build_client_datasets(
     client_map: Dict[int, List[dict]],
     *,
     parts_dir: Path,
-    feature_cols: List[str],
-    label_col: str,
 ) -> Dict[int, Dataset]:
     return {
-        cid: ClientParquetRowsDataset(parts_dir, part_list, feature_cols, label_col)
+        cid: ClientNpzDataset(parts_dir, part_list)
         for cid, part_list in client_map.items()
     }
 
@@ -289,6 +325,9 @@ def run_federated_learning(
     clients_per_round: int,
     eval_fn=None,
     seed: int = 42,
+    lr: float = 1e-3,
+    local_epochs: int = 1,
+    lr_scheduler: Optional[str] = None,
 ) -> Tuple[ServerPayload, dict, dict]:
     rng        = random.Random(seed)
     all_cids   = list(range(len(clients)))
@@ -309,27 +348,34 @@ def run_federated_learning(
 
         updates: List[ClientUpdate] = []
         for cid in selected:
-            updates.append(clients[cid].local_train(payload))
+            updates.append(clients[cid].local_train(
+                payload,
+                lr=lr,
+                local_epochs=local_epochs,
+                lr_scheduler=lr_scheduler,
+                current_round=rnd,
+                total_rounds=num_rounds,
+            ))
 
         global_state = strategy.aggregate(global_state, updates)
 
         # Accumulate bandwidth
-        round_bytes      = sum(u.bytes_sent for u in updates)
+        round_bytes = sum(u.bytes_sent for u in updates)
         cumulative_bytes += round_bytes
 
-        # Evaluate on round 1, every 5 rounds, and the final round
-        if eval_fn is not None and (rnd == 1 or rnd % 5 == 0 or rnd == num_rounds):
-            m = eval_fn(global_state, clients)
-            if m:
-                last_eval_m = m
-                history["rounds"].append(rnd)
-                history["accuracy"].append(m.get("accuracy", 0.0))
-                history["f1_macro"].append(m.get("f1_macro", 0.0))
-                history["f1_weighted"].append(m.get("f1_weighted", 0.0))
-                history["bytes_communicated"].append(cumulative_bytes)
-                pbar.set_postfix(
-                    {k: f"{v:.4f}" for k, v in m.items() if isinstance(v, float)}
-                )
+        # # Evaluate on round 1, every 5 rounds, and the final round
+        # if eval_fn is not None and (rnd == 1 or rnd % 5 == 0 or rnd == num_rounds):
+        m = eval_fn(global_state, clients)
+        if m:
+            last_eval_m = m
+            history["rounds"].append(rnd)
+            history["accuracy"].append(m.get("accuracy", 0.0))
+            history["f1_macro"].append(m.get("f1_macro", 0.0))
+            history["f1_weighted"].append(m.get("f1_weighted", 0.0))
+            history["bytes_communicated"].append(cumulative_bytes)
+            pbar.set_postfix(
+                {k: f"{v:.4f}" for k, v in m.items() if isinstance(v, float)}
+            )
 
     final_results: dict = {}
     if history["accuracy"]:
@@ -361,9 +407,15 @@ def train_baselines(
     num_rounds: int,
     clients_per_round: int,
     num_classes: int,
+    model_arch,
+    input_dim: int,
+    device: str,
     public_loader: Optional[DataLoader] = None,
     seed: int = 42,
     eval_fn=None,
+    lr: float = 1e-3,
+    local_epochs: int = 1,
+    lr_scheduler: Optional[str] = None,
 ) -> Dict[str, dict]:
     init_client_weights = [copy.deepcopy(c.model.state_dict()) for c in clients]
     template_weights    = copy.deepcopy(init_client_weights[0])
@@ -374,18 +426,26 @@ def train_baselines(
         if name == "fedmd":
             if public_loader is None:
                 raise ValueError("FedMD requires public_loader.")
-            n_pub = len(public_loader.dataset)
-            return ServerPayload(
-                pub_logits=np.zeros((n_pub, num_classes), dtype=np.float32)
-            )
+            tmp = model_arch(input_dim=input_dim, num_classes=num_classes).to(device)
+            tmp.load_state_dict(copy.deepcopy(template_weights), strict=True)
+            tmp.eval()
+            logits_list = []
+            with torch.no_grad():
+                for x, _ in public_loader:
+                    logits_list.append(tmp(x.to(device)).cpu())
+            init_logits = torch.cat(logits_list).numpy().astype(np.float32)
+            return ServerPayload(weights=None, pub_logits=init_logits)
         raise ValueError(f"Unknown strategy: {name}")
 
     strategy_builders = {
         "fedavg":     lambda: FedAvgAlgorithm(initial_weights=copy.deepcopy(template_weights)),
         "fedprox":    lambda: FedProxAlgorithm(initial_weights=copy.deepcopy(template_weights), mu=0.01),
         "fedmd":      lambda: FedMDAlgorithm(
-            n_pub=(len(public_loader.dataset) if public_loader else 0),
+            model_arch=model_arch,
+            input_dim=input_dim,
             num_classes=num_classes,
+            public_loader=public_loader,
+            device=device,
         ),
         "fedprotokd": lambda: FedProtoKDAlgorithm(initial_weights=copy.deepcopy(template_weights)),
     }
@@ -398,18 +458,18 @@ def train_baselines(
         for i, c in enumerate(clients):
             c.model.load_state_dict(copy.deepcopy(init_client_weights[i]), strict=True)
 
-        if name == "fedavg":
-            plugins = [FedAvgPlugin()]
-        elif name == "fedprox":
-            plugins = [FedAvgPlugin(), FedProxPlugin(mu=0.01)]
-        elif name == "fedmd":
-            plugins = [FedAvgPlugin(), FedMDPlugin(T=2.0, kd_lambda=1.0)]
-        elif name == "fedprotokd":
-            plugins = [FedAvgPlugin(), FedProtoKDPlugin(alpha_proto=0.3)]
-        else:
-            plugins = []
-
+# fix this code
         for c in clients:
+            if name == "fedavg":
+                plugins = [FedAvgPlugin()]
+            elif name == "fedprox":
+                plugins = [FedAvgPlugin(), FedProxPlugin(mu=0.01)]
+            elif name == "fedmd":
+                plugins = [FedMDPlugin(T=2.0, kd_lambda=1.0)]
+            elif name == "fedprotokd":
+                plugins = [FedProtoKDPlugin(alpha_proto=0.3)]
+            else:
+                plugins = []
             c.set_plugins(plugins)
 
         strategy           = strategy_builders[name]()
@@ -423,6 +483,9 @@ def train_baselines(
             clients_per_round=clients_per_round,
             eval_fn=eval_fn,
             seed=seed,
+            lr=lr,
+            local_epochs=local_epochs,
+            lr_scheduler=lr_scheduler,
         )
         results[name] = {
             "server_state":  server_state,
@@ -443,6 +506,8 @@ def make_eval_fn(model_arch, input_dim: int, num_classes: int, test_loader, devi
     For FedMD (server_state.weights is None), averages client weights for evaluation.
     Returns accuracy, f1_macro, f1_weighted, y_true (list), y_pred (list).
     """
+
+    tmp = model_arch(input_dim=input_dim, num_classes=num_classes)
     def eval_fn(server_state: ServerPayload, clients: List[FLClient]) -> dict:
         if server_state.weights is not None:
             weights = server_state.weights
@@ -465,11 +530,10 @@ def make_eval_fn(model_arch, input_dim: int, num_classes: int, test_loader, devi
         if weights is None:
             return {}
 
-        tmp = model_arch(input_dim=input_dim, num_classes=num_classes)
-        tmp.load_state_dict(weights, strict=False)
-
+        tmp.load_state_dict(weights, strict=True)
+        tmp.eval()
         y_true, y_pred = src.eval.metrics.infer(tmp, test_loader, device)
-        m              = src.eval.metrics.compute_metrics(y_true, y_pred)
+        m = src.eval.metrics.compute_metrics(y_true, y_pred)
         return {
             "accuracy":   m["accuracy"],
             "f1_macro":   m["f1_macro"],
@@ -571,22 +635,36 @@ def generate_comparison_table(
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    print(f"Using device: {device}", flush=True)
+    if device == "cuda":
+        torch.zeros(1).cuda()
+        print(f"CUDA initialized: {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     HP = {
-        "num_rounds":       5,
-        "clients_per_round": 10,
-        "batch_size":       1024,
-        "lr":               1e-3,
+        "num_rounds":       20,
+        "clients_per_round": 4,
+        "batch_size":       8192,
+        "lr":               3e-4,       # lowered from 1e-3 — non-IID Dirichlet(0.1) causes
+                                        # large conflicting gradients across clients; a smaller
+                                        # LR reduces the magnitude of client drift per round
+        "local_epochs":     3,          # raised from 1 — more local steps let each client
+                                        # learn meaningful features before aggregation
+        "lr_scheduler":     "cosine",   # "cosine" | "step" | None — decays LR within each
+                                        # client's local training phase so the final updates
+                                        # before aggregation are small (reduces drift further)
     }
 
-    strategies_to_run_base = ["fedprox","fedavg","fedmd","fedprotokd"]
+    strategies_to_run_base = ["fedprox","fedavg","fedprotokd"]
 
     for ds_name, ds_cfg in DATASETS.items():
-        parquets_dir = Path(ds_cfg["parquets"])
+        if RUN_DATASET and ds_name != RUN_DATASET:
+            continue
+        data_dir = Path(ds_cfg["data_dir"])
 
         # Skip if the dataset hasn't been preprocessed yet
-        if not list(parquets_dir.glob("*.parquet")):
-            print(f"\n[SKIP] {ds_name}: no parquet files in {parquets_dir}")
+        if not list(data_dir.glob("*.npz")):
+            print(f"\n[SKIP] {ds_name}: no .npz files in {data_dir}")
             continue
 
         # Load dataset metadata
@@ -597,7 +675,6 @@ def main():
             label_encoder = json.load(f)
 
         feature_cols = meta["num_cols"] + meta["cat_cols"]
-        label_col    = meta["label_encoded_col"]
         num_classes  = len(label_encoder)
         class_names  = [k for k, _ in sorted(label_encoder.items(), key=lambda x: x[1])]
 
@@ -616,6 +693,8 @@ def main():
             type_to_files[ptype].append(pf)
 
         for model_name, model_arch in MODEL_BUILDERS.items():
+            if RUN_MODEL and model_name != RUN_MODEL:
+                continue
             log("MODEL_START", dataset=ds_name, model=model_name)
 
             for ptype, pfiles in sorted(type_to_files.items()):
@@ -636,10 +715,8 @@ def main():
                         print(f"  [WARN] Missing test manifest: {test_manifest} — skipping seed {seed}")
                         continue
                     test_loader = make_test_loader(
-                        parts_dir=parquets_dir,
+                        parts_dir=data_dir,
                         test_manifest_path=test_manifest,
-                        feature_cols=feature_cols,
-                        label_col=label_col,
                         batch_size=HP["batch_size"],
                     )
 
@@ -650,10 +727,8 @@ def main():
                     public_loader: Optional[DataLoader] = None
                     if public_manifest.exists():
                         public_loader = make_public_loader(
-                            parts_dir=parquets_dir,
+                            parts_dir=data_dir,
                             public_manifest_path=public_manifest,
-                            feature_cols=feature_cols,
-                            label_col=label_col,
                             batch_size=256,
                         )
 
@@ -666,20 +741,21 @@ def main():
                     client_map, num_clients = load_partition_manifest(pf)
                     client_datasets = build_client_datasets(
                         client_map,
-                        parts_dir=parquets_dir,
-                        feature_cols=feature_cols,
-                        label_col=label_col,
+                        parts_dir=data_dir,
                     )
+                    NUM_WORKERS = 0
+
                     client_loaders = {
-                        cid: DataLoader(
-                            ds,
-                            batch_size=HP["batch_size"],
-                            shuffle=False,
-                            num_workers=0,
-                            pin_memory=torch.cuda.is_available(),
-                        )
-                        for cid, ds in client_datasets.items()
-                    }
+                            cid: DataLoader(
+                                ds,
+                                batch_size=HP["batch_size"],
+                                shuffle=True,
+                                num_workers=NUM_WORKERS,
+                                pin_memory=torch.cuda.is_available(),
+                                persistent_workers=False,
+                            )
+                            for cid, ds in client_datasets.items()
+                        }
 
                     # --- Build FL clients ---
                     fl_clients: List[FLClient] = [
@@ -700,15 +776,21 @@ def main():
                     )
 
                     results = train_baselines(
-                        strategies_to_run=strats,
-                        clients=fl_clients,
-                        num_rounds=HP["num_rounds"],
-                        clients_per_round=HP["clients_per_round"],
-                        num_classes=num_classes,
-                        public_loader=public_loader,
-                        seed=seed,
-                        eval_fn=eval_fn,
-                    )
+                            strategies_to_run=strats,
+                            clients=fl_clients,
+                            num_rounds=HP["num_rounds"],
+                            clients_per_round=HP["clients_per_round"],
+                            num_classes=num_classes,
+                            model_arch=model_arch,
+                            input_dim=len(feature_cols),
+                            device=device,
+                            public_loader=public_loader,
+                            seed=seed,
+                            eval_fn=eval_fn,
+                            lr=HP["lr"],
+                            local_epochs=HP["local_epochs"],
+                            lr_scheduler=HP.get("lr_scheduler"),
+                        )
                     type_seed_results[seed] = results
                     log("SEED_DONE", seed=seed, strategies=list(results.keys()))
 
@@ -744,7 +826,7 @@ def main():
                         continue
                     title     = f"{ds_name} | {ptype} | {model_name} | {strat_name}"
                     fname     = _safe_stem(f"cm_{ds_name}_{ptype}_{model_name}_{strat_name}")
-                    save_path = f"results/figures/{fname}.png"
+                    save_path = f"{RESULTS_ROOT}/figures/{fname}.png"
                     src.eval.metrics.plot_confusion_matrix(
                         y_true, y_pred, class_names, title, save_path
                     )
@@ -752,7 +834,7 @@ def main():
                 # --- Training curves (last seed) ---
                 last_histories = {s: last_results[s]["history"] for s in last_results}
                 curves_fname   = _safe_stem(f"curves_{ds_name}_{ptype}_{model_name}")
-                plot_training_curves(last_histories, f"results/figures/{curves_fname}.png")
+                plot_training_curves(last_histories, f"{RESULTS_ROOT}/figures/{curves_fname}.png")
 
                 # --- Comparison table (mean across seeds) ---
                 table_data: Dict[str, dict] = {}
@@ -769,7 +851,7 @@ def main():
                         "total_bytes":float(np.mean([fr.get("total_bytes", 0) for fr in seed_frs])),
                     }
                 table_fname = _safe_stem(f"table_{ds_name}_{ptype}_{model_name}")
-                generate_comparison_table(table_data, f"results/tables/{table_fname}.txt")
+                generate_comparison_table(table_data, f"{RESULTS_ROOT}/tables/{table_fname}.txt")
 
         print(f"\n[DONE] Dataset: {ds_name}")
 

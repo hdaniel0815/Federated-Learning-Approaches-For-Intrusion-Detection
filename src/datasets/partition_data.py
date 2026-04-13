@@ -2,11 +2,7 @@ import os, json
 from pathlib import Path
 from typing import Dict, List, Union
 import numpy as np
-import pandas as pd
-import pyarrow.parquet as pq
 from tqdm import tqdm
-
-LABEL_COL = "label_encoded"   # must exist in final parquets
 
 # ---------------------------------------------------------------------------
 # Per-dataset config
@@ -14,22 +10,19 @@ LABEL_COL = "label_encoded"   # must exist in final parquets
 
 DATASETS = {
     "cic2018": {
-        "parts_dir":  "data/cic2018/processed_final",
-        "label_col":  "label_encoded",
+        "data_dir":   "data/cic2018/processed_final",
         "out_train":  "partitions/cic2018/train",
         "out_test":   "partitions/cic2018/test",
         "out_public": "partitions/cic2018/public",
     },
     "cic2017": {
-        "parts_dir":  "data/cic2017/processed_final",
-        "label_col":  "label_encoded",
+        "data_dir":   "data/cic2017/processed_final",
         "out_train":  "partitions/cic2017/train",
         "out_test":   "partitions/cic2017/test",
         "out_public": "partitions/cic2017/public",
     },
     # "unswnb15": {
-    #     "parts_dir":  "data/unswnb15/processed_final",
-    #     "label_col":  "label_encoded",
+    #     "data_dir":   "data/unswnb15/processed_final",
     #     "out_train":  "partitions/unswnb15/train",
     #     "out_test":   "partitions/unswnb15/test",
     #     "out_public": "partitions/unswnb15/public",
@@ -40,19 +33,33 @@ DATASETS = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def list_parts(parquet_dir: str) -> List[Path]:
-    parts = sorted(Path(parquet_dir).glob("*.parquet"))
+def list_parts(data_dir: str) -> List[Path]:
+    parts = sorted(Path(data_dir).glob("*.npz"))
     if not parts:
-        raise FileNotFoundError(f"No parquet parts found in {parquet_dir}")
+        raise FileNotFoundError(f"No .npz parts found in {data_dir}")
     return parts
+
+
+def _load_labels(p: Path) -> np.ndarray:
+    """Load only the y (label) array from an .npz file."""
+    return np.load(p)["y"]
+
+
+def _load_day(p: Path) -> np.ndarray:
+    """Load only the day array from an .npz file."""
+    return np.load(p)["day"]
+
+
+def _num_rows(p: Path) -> int:
+    return int(_load_labels(p).shape[0])
 
 
 def save_partition(partition: Dict, output_path: str, metadata: Dict = None):
     output = {
-        "num_clients":    len(partition),
-        "total_samples":  sum(sum(len(b["rows"]) for b in blocks)
-                              for blocks in partition.values()),
-        "partition":      partition,
+        "num_clients":   len(partition),
+        "total_samples": sum(sum(len(b["rows"]) for b in blocks)
+                             for blocks in partition.values()),
+        "partition":     partition,
     }
     if metadata:
         output["metadata"] = metadata
@@ -66,7 +73,7 @@ def save_test_parts(test_parts: List[Path], output_dir: str, seed: int):
     output = {
         "num_parts":  len(test_parts),
         "test_parts": [
-            {"part": p.name, "num_rows": pq.read_metadata(p).num_rows}
+            {"part": p.name, "num_rows": _num_rows(p)}
             for p in test_parts
         ],
     }
@@ -81,7 +88,7 @@ def save_public_parts(public_parts: List[Path], output_dir: str, seed: int):
     output = {
         "num_parts":    len(public_parts),
         "public_parts": [
-            {"part": p.name, "num_rows": pq.read_metadata(p).num_rows}
+            {"part": p.name, "num_rows": _num_rows(p)}
             for p in public_parts
         ],
     }
@@ -97,7 +104,7 @@ def save_public_parts(public_parts: List[Path], output_dir: str, seed: int):
 # ---------------------------------------------------------------------------
 
 def split_parts_train_test_public(
-    parts_dir: str,
+    data_dir: str,
     test_frac: float = 0.2,
     public_frac: float = 0.1,
     seed: int = 42,
@@ -106,7 +113,7 @@ def split_parts_train_test_public(
     Returns (train_parts, test_parts, public_parts) — three disjoint Path lists.
     test and public are drawn first so training always gets the majority.
     """
-    parts = list_parts(parts_dir)
+    parts = list_parts(data_dir)
     rng   = np.random.default_rng(seed)
     idx   = rng.permutation(len(parts))
 
@@ -126,17 +133,15 @@ def split_parts_train_test_public(
 # Dirichlet non-IID partitioning
 # ---------------------------------------------------------------------------
 
-def partition_dirichlet_parquet(
+def partition_dirichlet(
     parts_dir_or_list: Union[str, List[Path]],
     num_clients: int = 10,
     alpha: float = 0.5,
     seed: int = 42,
-    label_col: str = LABEL_COL,
 ) -> Dict:
     """
-    Parquet-safe Dirichlet non-IID partitioning.
-    Accepts either a directory path string or a pre-filtered list of Path objects
-    (the latter allows restricting to train-only files from the three-way split).
+    Dirichlet non-IID partitioning over .npz files.
+    Accepts either a directory path string or a pre-filtered list of Path objects.
 
     Returns: {client_id: [{"part": filename, "rows": [...]}, ...]}
     """
@@ -147,17 +152,16 @@ def partition_dirichlet_parquet(
     # --- Pass 1: count total samples per class ---
     class_counts: Dict[int, int] = {}
     for p in tqdm(parts, desc="Pass 1: count labels"):
-        df = pd.read_parquet(p, columns=[label_col])
-        vc = df[label_col].value_counts(dropna=False).to_dict()
-        for k, c in vc.items():
-            if pd.isna(k):
+        y = _load_labels(p)
+        for k in np.unique(y):
+            if k < 0:
                 continue
             k = int(k)
-            class_counts[k] = class_counts.get(k, 0) + int(c)
+            class_counts[k] = class_counts.get(k, 0) + int((y == k).sum())
 
     classes = sorted(class_counts.keys())
     if not classes:
-        raise ValueError(f"No labels found in column '{label_col}'.")
+        raise ValueError("No valid labels found in .npz files.")
 
     # --- Sample Dirichlet proportions → integer quotas per client per class ---
     targets = {}
@@ -178,17 +182,14 @@ def partition_dirichlet_parquet(
     partition = {f"client_{i}": [] for i in range(num_clients)}
 
     for p in tqdm(parts, desc="Pass 2: assign rows"):
-        df = pd.read_parquet(p, columns=[label_col])
-        y  = df[label_col].to_numpy()
+        y         = _load_labels(p)
         part_name = p.name
 
         rows_for_client = {i: [] for i in range(num_clients)}
 
         for r, label in enumerate(y):
-            if pd.isna(label):
-                continue
             k = int(label)
-            if k not in remaining:
+            if k < 0 or k not in remaining:
                 continue
 
             need       = remaining[k]
@@ -198,7 +199,6 @@ def partition_dirichlet_parquet(
                 ci = int(rng.choice(candidates))
                 remaining[k][ci] -= 1
             else:
-                # quota exhausted for all clients; assign randomly (overflow)
                 ci = int(rng.integers(0, num_clients))
             rows_for_client[ci].append(r)
 
@@ -213,33 +213,27 @@ def partition_dirichlet_parquet(
 # IID partitioning (baseline)
 # ---------------------------------------------------------------------------
 
-def partition_iid_parquet(
+def partition_iid(
     parts_dir_or_list: Union[str, List[Path]],
     num_clients: int = 10,
     seed: int = 42,
-    label_col: str = LABEL_COL,
 ) -> Dict:
-    """
-    Uniform random (IID) split across clients.
-    Used as the IID baseline to confirm non-IID is the cause of degradation.
-    """
+    """Uniform random (IID) split across clients."""
     rng   = np.random.default_rng(seed)
     parts = (parts_dir_or_list if isinstance(parts_dir_or_list, list)
              else list_parts(parts_dir_or_list))
 
-    # Collect (part_name, row_index) pairs and shuffle globally
     all_rows: List[tuple] = []
     for p in tqdm(parts, desc="IID: collecting rows"):
-        df = pd.read_parquet(p, columns=[label_col])
-        for r in range(len(df)):
+        y = _load_labels(p)
+        for r in range(len(y)):
             all_rows.append((p.name, r))
 
-    perm = rng.permutation(len(all_rows))
+    perm   = rng.permutation(len(all_rows))
     splits = np.array_split(perm, num_clients)
 
     partition = {f"client_{i}": [] for i in range(num_clients)}
     for ci, split_idx in enumerate(splits):
-        # Group contiguous rows per part to avoid huge row lists
         from collections import defaultdict
         part_to_rows: dict = defaultdict(list)
         for idx in split_idx:
@@ -255,9 +249,8 @@ def partition_iid_parquet(
 # Realistic day-based partitioning
 # ---------------------------------------------------------------------------
 
-def partition_by_day_parquet(
+def partition_by_day(
     parts_dir_or_list: Union[str, List[Path]],
-    day_col: str = "day",
 ) -> Dict:
     """One client per unique day value (natural heterogeneity)."""
     parts = (parts_dir_or_list if isinstance(parts_dir_or_list, list)
@@ -265,8 +258,8 @@ def partition_by_day_parquet(
 
     days: set = set()
     for p in parts:
-        df = pd.read_parquet(p, columns=[day_col])
-        days.update(df[day_col].dropna().astype(str).unique())
+        day_arr = _load_day(p)
+        days.update(d for d in day_arr if d)
 
     days = sorted(days)
     day_to_client = {day: i for i, day in enumerate(days)}
@@ -276,14 +269,12 @@ def partition_by_day_parquet(
     partition = {f"client_{i}": [] for i in range(num_clients)}
 
     for p in tqdm(parts, desc="Day partition"):
-        df = pd.read_parquet(p, columns=[day_col])
+        day_arr   = _load_day(p)
         part_name = p.name
         for day, ci in day_to_client.items():
-            mask = df[day_col].astype(str) == day
-            if mask.any():
-                rows = np.flatnonzero(mask.to_numpy()).tolist()
-                if rows:
-                    partition[f"client_{ci}"].append({"part": part_name, "rows": rows})
+            rows = np.flatnonzero(day_arr == day).tolist()
+            if rows:
+                partition[f"client_{ci}"].append({"part": part_name, "rows": rows})
 
     return partition
 
@@ -301,15 +292,13 @@ def main():
     alphas = [0.1, 0.5, 1.0]
 
     for ds_name, cfg in DATASETS.items():
-        parts_dir  = cfg["parts_dir"]
-        label_col  = cfg["label_col"]
+        data_dir   = cfg["data_dir"]
         out_train  = cfg["out_train"]
         out_test   = cfg["out_test"]
         out_public = cfg["out_public"]
 
-        # Check dataset exists
-        if not list(Path(parts_dir).glob("*.parquet")):
-            print(f"\n[SKIP] {ds_name}: no parquet files in {parts_dir}")
+        if not list(Path(data_dir).glob("*.npz")):
+            print(f"\n[SKIP] {ds_name}: no .npz files in {data_dir}")
             continue
 
         print(f"\n{'='*60}")
@@ -318,19 +307,15 @@ def main():
 
         for seed in seeds:
             train_parts, test_parts, public_parts = split_parts_train_test_public(
-                parts_dir, test_frac=0.2, public_frac=0.1, seed=seed
+                data_dir, test_frac=0.2, public_frac=0.1, seed=seed
             )
             save_test_parts(test_parts, out_test, seed)
             save_public_parts(public_parts, out_public, seed)
 
             # Dirichlet non-IID partitions on train parts only
             for alpha in alphas:
-                part = partition_dirichlet_parquet(
-                    train_parts,
-                    num_clients=10,
-                    alpha=alpha,
-                    seed=seed,
-                    label_col=label_col,
+                part = partition_dirichlet(
+                    train_parts, num_clients=10, alpha=alpha, seed=seed,
                 )
                 save_partition(
                     part,
@@ -338,36 +323,32 @@ def main():
                     metadata={
                         "dataset": ds_name, "strategy": "dirichlet",
                         "alpha": alpha, "num_clients": 10, "seed": seed,
-                        "parts_dir": parts_dir, "label_col": label_col,
+                        "data_dir": data_dir,
                     },
                 )
 
             # IID baseline partition
-            iid_part = partition_iid_parquet(
-                train_parts, num_clients=10, seed=seed, label_col=label_col
-            )
+            iid_part = partition_iid(train_parts, num_clients=10, seed=seed)
             save_partition(
                 iid_part,
                 os.path.join(out_train, f"{ds_name}_iid_seed_{seed}.json"),
                 metadata={
                     "dataset": ds_name, "strategy": "iid",
-                    "num_clients": 10, "seed": seed,
-                    "parts_dir": parts_dir, "label_col": label_col,
+                    "num_clients": 10, "seed": seed, "data_dir": data_dir,
                 },
             )
 
-        # Realistic day-based partition (seed-independent; uses all train parts from seed=42)
+        # Realistic day-based partition (seed-independent; uses train parts from seed=42)
         train_parts_42, _, _ = split_parts_train_test_public(
-            parts_dir, test_frac=0.2, public_frac=0.1, seed=42
+            data_dir, test_frac=0.2, public_frac=0.1, seed=42
         )
-        realistic = partition_by_day_parquet(train_parts_42, day_col="day")
+        realistic = partition_by_day(train_parts_42)
         save_partition(
             realistic,
             os.path.join(out_train, f"{ds_name}_realistic_day.json"),
             metadata={
                 "dataset": ds_name, "strategy": "day",
-                "num_clients": len(realistic), "seed": 42,
-                "parts_dir": parts_dir,
+                "num_clients": len(realistic), "seed": 42, "data_dir": data_dir,
             },
         )
 

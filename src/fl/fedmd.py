@@ -1,108 +1,142 @@
+"""
+Round flow
+──────────
+1. Server → clients : consensus logits  (no weights)
+2. Each client       : trains on private data + KL-distills from consensus
+3. Clients → server  : each client's logits on the public dataset
+4. Server            : weighted-averages those logits → new consensus
+"""
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-from .base import FederatedStrategy
-from .base import ServerPayload, ClientUpdate
+from .base import FederatedStrategy, ServerPayload, ClientUpdate
+from typing import Optional
 
+
+# ───────────────────────────────────────────────────────────────────
+# Server-side strategy
+# ───────────────────────────────────────────────────────────────────
 
 class FedMDAlgorithm(FederatedStrategy):
     name = "fedmd"
 
-    def __init__(self, n_pub: int, num_classes: int):
-        self.n_pub = n_pub
-        self.num_classes = num_classes
+    def __init__(self, model_arch, input_dim, num_classes, public_loader, device):
+        self.public_loader = public_loader
+        self.device = device
+        # Kept for init_server_payload seed logits
+        self._model_arch = model_arch
+        self._input_dim = input_dim
+        self._num_classes = num_classes
 
     def init_server_payload(self):
-        # teacher logits start at zeros (common baseline)
+        """Seed consensus with logits from a random model (before any training)."""
+        tmp = self._model_arch(self._input_dim, self._num_classes).to(self.device)
+        tmp.eval()
+        logits_list = []
+        with torch.no_grad():
+            for x, _ in self.public_loader:
+                logits_list.append(tmp(x.to(self.device)).cpu())
+        init_logits = torch.cat(logits_list, dim=0).numpy().astype(np.float32)
+        # weights=None → clients keep their own local weights
+        return ServerPayload(weights=None, pub_logits=init_logits)
+
+    def server_payload(self, global_state: ServerPayload) -> ServerPayload:
+        """Broadcast consensus logits only — no weights."""
+        return ServerPayload(weights=None, pub_logits=global_state.pub_logits)
+
+    def aggregate(
+        self, global_state: ServerPayload, client_updates: list[ClientUpdate]
+    ) -> ServerPayload:
+        """
+        Weighted average of the logit arrays each client computed on the
+        public dataset.  No weight aggregation — that's the whole point
+        of FedMD (enables heterogeneous client architectures).
+        """
+        valid = [u for u in client_updates if u.pub_logits is not None and u.n_samples > 0]
+        if not valid:
+            return global_state
+
+        total = sum(u.n_samples for u in valid)
+        consensus = np.zeros_like(valid[0].pub_logits, dtype=np.float64)
+        for u in valid:
+            consensus += np.array(u.pub_logits, dtype=np.float64) * (u.n_samples / total)
+
         return ServerPayload(
-            pub_logits=np.zeros((self.n_pub, self.num_classes), dtype=np.float32)
+            weights=None,
+            pub_logits=consensus.astype(np.float32),
         )
 
-    def server_payload(self, global_model: ServerPayload):
-        # broadcast teacher logits to clients
-        return global_model
 
-    # weighted aggregation
-    def aggregate(self, global_model: ServerPayload, client_updates: list[ClientUpdate]):
-        # aggregate client pub_logits -> new teacher pub_logits
-        updates = [u for u in client_updates if u.pub_logits is not None and u.n_samples > 0]
-        if not updates:
-            return global_model
-
-        total = sum(u.n_samples for u in updates)
-
-        # weighted mean of logits across clients
-        agg = np.zeros_like(updates[0].pub_logits, dtype=np.float32)
-        for u in updates:
-            frac = u.n_samples / total
-            agg += u.pub_logits.astype(np.float32) * frac
-
-        return ServerPayload(
-            weights=global_model.weights,          # usually None in FedMD
-            pub_logits=agg,
-            prototypes=global_model.prototypes,    # usually None
-        )
-    
+# ───────────────────────────────────────────────────────────────────
+# Client-side plugin
+# ───────────────────────────────────────────────────────────────────
 
 class FedMDPlugin:
+    """
+    Client-side behaviour for FedMD:
+      • on_round_start : cache the consensus logits
+      • extra_loss     : KL divergence between student logits and consensus
+      • on_round_end   : compute this client's logits on the public dataset
+                         and return them so they're sent to the server
+    """
+
     def __init__(self, T: float = 2.0, kd_lambda: float = 1.0):
         self.T = T
         self.kd_lambda = kd_lambda
+        self._pub_logits: Optional[torch.Tensor] = None
+        self._pub_index = 0
 
-    def on_round_start(self, client, payload: ServerPayload):
+    # ── hooks ──────────────────────────────────────────────────────
+
+    def on_round_start(self, client, payload: ServerPayload) -> None:
+        if payload.pub_logits is not None:
+            self._pub_logits = torch.tensor(
+                payload.pub_logits, dtype=torch.float32,
+            ).to(client.device)
+        self._pub_index = 0
+
+    def extra_loss(self, client, batch, outputs, payload) -> torch.Tensor:
+        """KL(student || consensus) on a slice of the public logits."""
+        if self._pub_logits is None:
+            return torch.tensor(0.0, device=client.device)
+
+        logits, _, _ = outputs
+        bsz = logits.size(0)
+
+        # Slide a window through the cached public logits so each
+        # private-data batch gets a different slice of the consensus.
+        end = min(self._pub_index + bsz, self._pub_logits.size(0))
+        target_logits = self._pub_logits[self._pub_index:end]
+        self._pub_index = end % self._pub_logits.size(0)
+
+        n = min(bsz, target_logits.size(0))
+        loss = F.kl_div(
+            F.log_softmax(logits[:n] / self.T, dim=-1),
+            F.softmax(target_logits[:n] / self.T, dim=-1),
+            reduction="batchmean",
+        ) * (self.T ** 2)
+
+        return self.kd_lambda * loss
+
+    def after_step(self, client, batch, forward_out, payload: ServerPayload):
         pass
 
-    def extra_loss(self, client, batch, forward_out, payload: ServerPayload):
-        # FedMD distillation is usually on PUBLIC data, not private batches,
-        # so we keep this as no-op here and do KD in on_round_end (or a separate phase).
-        return torch.tensor(0.0, device=client.device)
-
-    def after_step(self, client, batch, forward_out, payload):
-        pass
-
-    def on_round_end(self, client, payload: ServerPayload):
-        if payload.pub_logits is None:
-            return {}
+    def on_round_end(self, client, payload: ServerPayload) -> dict:
+        """
+        Compute this client's logits on the public dataset.
+        This is the ONLY thing that crosses the wire in FedMD.
+        """
         if client.public_loader is None:
-            raise RuntimeError("FedMDPlugin requires client.public_loader")
+            return {}
 
-        # 1) Distill on public data using teacher logits from server payload
-        teacher = torch.from_numpy(payload.pub_logits).to(client.device).float()
-        T = self.T
-
-        client.model.train()
-        opt = torch.optim.Adam(client.model.parameters(), lr=1e-3)
-
-        offset = 0
-        for x_pub, _ in client.public_loader:
-            x_pub = x_pub.to(client.device)
-            b = x_pub.size(0)
-            t = teacher[offset:offset + b]
-            offset += b
-
-            opt.zero_grad()
-            out = client.model(x_pub)
-            logits = out[0] if isinstance(out, (tuple, list)) else out
-
-            kd = F.kl_div(
-                F.log_softmax(logits / T, dim=1),
-                F.softmax(t / T, dim=1),
-                reduction="batchmean",
-            ) * (T * T)
-
-            (self.kd_lambda * kd).backward()
-            opt.step()
-
-        # 2) Return this client’s logits on the public set (for server aggregation)
         client.model.eval()
-        outs = []
+        all_logits = []
         with torch.no_grad():
-            for x_pub, _ in tqdm(client.public_loader, desc="Public Loader Training"):
-                x_pub = x_pub.to(client.device)
-                out = client.model(x_pub)
-                logits = out[0] if isinstance(out, (tuple, list)) else out
-                outs.append(logits.detach())
-        pub_logits_out = torch.cat(outs, dim=0).cpu().numpy().astype(np.float32)
+            for x, _ in client.public_loader:
+                x = x.to(client.device)
+                logits = client.model(x)
+                all_logits.append(logits.cpu())
 
-        return {"pub_logits": pub_logits_out}
+        pub_logits = torch.cat(all_logits, dim=0).numpy().astype(np.float32)
+        return {"pub_logits": pub_logits}
